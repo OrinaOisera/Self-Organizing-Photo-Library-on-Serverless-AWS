@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Photo Butler - a self-organizing photo library (S3 -> Lambda -> Rekognition -> DynamoDB -> SNS)
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address that receives "New photo added" alerts
+  MinConfidence:
+    Type: Number
+    Default: 80
+    Description: Minimum Rekognition label confidence (0-100)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    Timeout: 30
+    MemorySize: 512
+
+Resources:
+  # --- Storage -------------------------------------------------------------
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub photo-butler-uploads-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ThumbnailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub photo-butler-thumbnails-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  PhotoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: photo-butler-photos
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: photoId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: photoId
+          KeyType: HASH
+
+  # --- Messaging -----------------------------------------------------------
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: photo-butler-notifications
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # Photos that fail after Lambda's automatic retries land here
+  FailedPhotosQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: photo-butler-failed-photos
+      MessageRetentionPeriod: 1209600
+
+  # --- Compute -------------------------------------------------------------
+  PhotoProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: photo-butler-processor
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Description: Thumbnails, auto-tags, and announces every new photo
+      Environment:
+        Variables:
+          THUMBNAIL_BUCKET: !Ref ThumbnailBucket
+          TABLE_NAME: !Ref PhotoTable
+          TOPIC_ARN: !Ref NotificationTopic
+          MIN_CONFIDENCE: !Ref MinConfidence
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt FailedPhotosQueue.Arn
+      Policies:
+        # Bucket names are built with !Sub (not !Ref) to avoid a circular
+        # dependency with the S3 event notification below.
+        - S3ReadPolicy:
+            BucketName: !Sub photo-butler-uploads-${AWS::AccountId}-${AWS::Region}
+        - S3WritePolicy:
+            BucketName: !Sub photo-butler-thumbnails-${AWS::AccountId}-${AWS::Region}
+        - DynamoDBWritePolicy:
+            TableName: !Ref PhotoTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action: rekognition:DetectLabels
+              Resource: '*'
+      Events:
+        PhotoUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpg
+        PngUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .png
+
+Outputs:
+  UploadBucketName:
+    Value: !Ref UploadBucket
+  ThumbnailBucketName:
+    Value: !Ref ThumbnailBucket
+  TableName:
+    Value: !Ref PhotoTable
+  FunctionName:
+    Value: !Ref PhotoProcessorFunction
+  FailedQueueUrl:
+    Value: !Ref FailedPhotosQueue

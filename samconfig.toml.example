@@ -1,0 +1,15 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "photo-butler"
+resolve_s3 = true
+s3_prefix = "photo-butler"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = true
+parameter_overrides = "NotificationEmail=\"you@example.com\" MinConfidence=\"80\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"
